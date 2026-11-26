@@ -171,9 +171,137 @@ Content-Type: application/json
 {"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
 ```
 
+## Part 4 — API Security
+
+### Exercise 4.1 — Xác thực bằng API key
+
+Em gửi ba request `POST /ask` đến bản develop, cùng body `{"question":"Hello"}`. Em dùng `curl -i` để ghi lại mã HTTP, header và nội dung phản hồi.
+
+**Thiếu header `X-API-Key`**
+
+```http
+HTTP/1.1 401 Unauthorized
+date: Thu, 26 Nov 2026 09:55:53 GMT
+server: uvicorn
+content-length: 67
+content-type: application/json
+
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+```
+
+**Gửi sai API key**
+
+```http
+HTTP/1.1 403 Forbidden
+date: Thu, 26 Nov 2026 09:55:53 GMT
+server: uvicorn
+content-length: 29
+content-type: application/json
+
+{"detail":"Invalid API key."}
+```
+
+**Gửi đúng API key**
+
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 09:55:53 GMT
+server: uvicorn
+content-length: 114
+content-type: application/json
+
+{"question":"Hello","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+- **API key được kiểm tra ở đâu?** `POST /ask` dùng `Depends(verify_api_key)`. Dependency đọc header `X-API-Key` và so sánh với giá trị app lấy từ biến môi trường `AGENT_API_KEY`. [Dependency](04-api-gateway/develop/app.py#L35-L54) · [Route `/ask`](04-api-gateway/develop/app.py#L67-L79)
+- **Khi key sai thì sao?** Kết quả chạy của em cho thấy thiếu key trả `401`, key sai trả `403`, còn key đúng cho phép request đi tiếp và nhận câu trả lời mock với mã `200`. [Các nhánh kiểm tra](04-api-gateway/develop/app.py#L44-L54)
+- **Đổi key thế nào?** Cập nhật `AGENT_API_KEY` trong môi trường chạy, khởi động lại app để nạp giá trị mới rồi cập nhật header `X-API-Key` ở client. [Cách app đọc biến môi trường](04-api-gateway/develop/app.py#L35)
+
+### Exercise 4.2 — Xác thực bằng JWT
+
+Em đăng nhập bằng tài khoản demo `student` qua `POST /auth/token`, lưu `access_token` vào biến `TOKEN` rồi gửi `Authorization: Bearer $TOKEN` khi gọi `POST /ask` với câu hỏi `Explain JWT`. Đây là phản hồi em nhận được bằng `curl -i`.
+
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 10:04:10 GMT
+server: uvicorn
+content-length: 184
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"question":"Explain JWT","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé.","usage":{"requests_remaining":9,"budget_remaining_usd":1.6e-05}}
+```
+
+Khi thông tin đăng nhập hợp lệ, server ký JWT bằng `HS256`. Token chứa username (`sub`), role (`role`), thời điểm cấp (`iat`) và thời điểm hết hạn (`exp`) sau 60 phút. Khi em gửi bearer token, `Depends(verify_token)` kiểm tra chữ ký và hạn dùng trước khi handler xử lý câu hỏi. [Endpoint đăng nhập](04-api-gateway/production/app.py#L105-L118) · [Tạo và xác minh JWT](04-api-gateway/production/auth.py#L35-L67)
+
+Phản hồi `200 OK` xác nhận request dùng JWT đã được xử lý. Trường `requests_remaining: 9` cho biết em còn 9 lượt trong cửa sổ rate limit hiện tại. Code mẫu gán `usage.total_cost_usd` vào trường `budget_remaining_usd`, nên giá trị `1.6e-05` là chi phí đã ghi nhận. [Handler `/ask`](04-api-gateway/production/app.py#L125-L162)
+
+### Exercise 4.3 — Rate limiting
+
+Em dùng JWT của tài khoản demo `student` để gửi liên tiếp 20 request `POST /ask` với cùng câu hỏi `What is Docker?`.
+
+| Lượt trong vòng lặp | Mã HTTP | Kết quả quan sát |
+| --- | --- | --- |
+| 1–10 | `200 OK` | `requests_remaining` giảm từ 9 ở lượt đầu xuống 0 ở lượt 10. |
+| 11–20 | `429 Too Many Requests` | Cả 10 lượt đều nhận `X-RateLimit-Limit: 10`, `X-RateLimit-Remaining: 0` và `Retry-After: 59`. |
+
+Phản hồi `curl -i` ở lượt 10, lượt cuối được chấp nhận trong lần thử này.
+
+```http
+HTTP/1.1 200 OK
+date: Thu, 26 Nov 2026 10:08:04 GMT
+server: uvicorn
+content-length: 197
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"question":"What is Docker?","answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!","usage":{"requests_remaining":0,"budget_remaining_usd":0.000205}}
+```
+
+Phản hồi `curl -i` ở lượt 11, lượt đầu bị chặn. `Retry-After: 59` cho biết client nên đợi 59 giây trước khi thử lại.
+
+```http
+HTTP/1.1 429 Too Many Requests
+date: Thu, 26 Nov 2026 10:08:04 GMT
+server: uvicorn
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795687745
+retry-after: 59
+content-length: 98
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+```
+
+- **Thuật toán.** App dùng cửa sổ trượt 60 giây. Mỗi username có một hàng đợi timestamp trong RAM. Khi có request mới, app bỏ các timestamp quá 60 giây, đếm số lượt còn trong hàng đợi và trả `429` nếu đã chạm hạn mức. Nếu còn lượt, app thêm timestamp của request hiện tại. [Thuật toán rate limit](04-api-gateway/production/rate_limiter.py#L24-L71)
+- **Hạn mức theo vai trò.** User như `student` có tối đa 10 lượt trong 60 giây. Route chọn limiter riêng cho role `admin` với tối đa 100 lượt trong 60 giây. Vòng lặp của em kiểm tra hạn mức của `student`. [Chọn limiter theo role](04-api-gateway/production/app.py#L137-L142) · [Hạn mức cấu hình](04-api-gateway/production/rate_limiter.py#L85-L87)
+
+### Exercise 4.4 — Cost guard
+
+**Cách bản mẫu hoạt động.** Trước khi gọi mock LLM, `POST /ask` chạy `check_budget(username)` để kiểm tra chi phí đã ghi nhận. Bản mẫu lưu usage trong RAM, trả `402` khi user chạm ngưỡng **1 USD/ngày** và trả `503` khi bộ đếm toàn hệ thống chạm ngưỡng **10 USD**. Sau khi có câu trả lời, app ước lượng số token đầu vào và đầu ra, tính chi phí theo đơn giá riêng cho từng loại token rồi cộng vào usage. Giá trị `0.000205` trong phản hồi lượt 10 ở Exercise 4.3 là chi phí đã ghi nhận theo cách tính của bản mẫu. [Luồng xử lý `/ask`](04-api-gateway/production/app.py#L140-L162) · [Ngưỡng và cách tính chi phí](04-api-gateway/production/cost_guard.py#L19-L104)
+
+**Cách em sẽ áp dụng ngân sách tháng.** Em lưu tổng chi phí theo user và tháng trong Redis với key dạng `budget:<user_id>:<YYYY-MM>`. Trước khi gọi LLM, nếu tổng đã dùng cộng chi phí ước tính của request vượt **10 USD/tháng**, em chặn request. Nếu còn ngân sách, em giữ trước khoản ước tính và điều chỉnh theo chi phí thực tế sau khi có kết quả. Việc kiểm tra và giữ ngân sách cần thực hiện nguyên tử để hai request đồng thời không cùng sử dụng phần ngân sách còn lại. Đầu tháng mới, app dùng key mới với tổng ban đầu là 0. [Yêu cầu Exercise 4.4](CODE_LAB.md#L410-L423)
+
+Rate limit kiểm soát tần suất gọi API. Cost guard kiểm soát số tiền đã dùng, vì các request có độ dài khác nhau có thể tốn số token khác nhau dù cùng nằm trong hạn mức lượt gọi.
+
 ## AI log
 
 - **CP1:** Em hỏi Codex về thứ tự làm lab và cách thực hiện Exercise 1.1–1.3. Codex gợi ý dòng code cần đọc, chỉ ra cú pháp query string của bản develop và soạn phần trình bày từ output em cung cấp. Em tự chạy hai app trong terminal, dùng `curl` để kiểm tra mã HTTP và nội dung phản hồi, rồi gửi output thực tế làm bằng chứng.
 - **CP2, Exercise 2.1–2.2.** Em hỏi Codex cách đọc Dockerfile, chạy container và hiểu lỗi trùng tên. Codex giải thích các chỉ thị trong Dockerfile và soạn mục trả lời từ log em cung cấp. Em tự chạy `docker build`, `docker run` và hai lệnh `curl` trong terminal, rồi gửi output để ghi lại kết quả thực tế.
 - **CP2, Exercise 2.3.** Em chạy build và `docker images` để lấy dung lượng hai image. Codex giải thích hai stage trong Dockerfile production và tính phần trăm giảm từ số đo em gửi.
 - **CP2, Exercise 2.4.** Em hỏi Codex cách chạy Compose và kiểm tra API qua Nginx. Em tự chạy stack, xem trạng thái bằng `docker compose ps` và dùng `curl` để kiểm tra hai endpoint. Codex đối chiếu cấu hình để vẽ sơ đồ và ghi kết quả từ output em gửi.
+- **CP3, Exercise 4.1.** Em hỏi Codex cách kiểm tra xác thực bằng API key và vị trí code xử lý. Codex hướng dẫn các lệnh `curl`, đối chiếu các nhánh xác thực và trình bày lại output em cung cấp. Em tự chạy ba trường hợp thiếu key, sai key và đúng key, rồi kiểm tra mã HTTP và nội dung từng phản hồi.
+- **CP3, Exercise 4.2.** Em hỏi Codex cách lấy JWT và dùng token để gọi API. Codex hướng dẫn lệnh đăng nhập, giải thích cách server ký và xác minh token, rồi ghi lại phản hồi em gửi. Em tự lấy token, gọi `POST /ask` bằng `curl` và kiểm tra phản hồi `200 OK`.
+- **CP3, Exercise 4.3.** Em hỏi Codex cách kiểm tra rate limit. Codex hướng dẫn vòng lặp `curl`, giải thích cửa sổ trượt và tóm tắt output em gửi. Em tự chạy 20 lượt, kiểm tra mã HTTP từng lượt và xác định lượt 11 là lượt đầu trả `429`.
+- **CP3, Exercise 4.4.** Em nhờ Codex giải thích cost guard của bản mẫu và cách thiết kế ngân sách tháng bằng Redis. Codex đối chiếu `check_budget`, `record_usage` với yêu cầu trong đề và giúp em viết phần giải thích. Phản hồi `curl` do em chạy ở Exercise 4.3 được dùng làm ví dụ cho giá trị chi phí đã ghi nhận.
