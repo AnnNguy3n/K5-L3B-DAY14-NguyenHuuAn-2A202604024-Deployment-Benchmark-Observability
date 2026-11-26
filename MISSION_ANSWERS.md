@@ -61,6 +61,119 @@ HOST=127.0.0.1 PORT=8000 DEBUG=false ENVIRONMENT=development python app.py
 | Logging | [`print()` in câu hỏi, key và câu trả lời](01-localhost-vs-production/develop/app.py#L32-L38). | [Code ghi sự kiện và độ dài câu hỏi, câu trả lời bằng logger](01-localhost-vs-production/production/app.py#L110-L122). Output em thu được có warning về mock và access log của Uvicorn. | Các trường theo sự kiện hỗ trợ tìm kiếm và theo dõi request mà không cần ghi API key hay toàn văn câu hỏi. |
 | Shutdown | App chưa khai báo bước dọn dẹp riêng. | [FastAPI lifespan đặt `is_ready = False` khi shutdown](01-localhost-vs-production/production/app.py#L39-L74). Nhận xét này dựa trên mã nguồn. | Lifecycle hook cho phép dọn tài nguyên khi app tắt. Graceful shutdown giúp các request đang xử lý có thời gian hoàn tất. |
 
+## Part 2 — Docker
+
+### Exercise 2.1 — Dockerfile cơ bản
+
+1. **Base image.** Dockerfile dùng `python:3.11`, image Python đầy đủ có sẵn Python 3.11 để chạy ứng dụng. [Dòng 6–8](02-docker/develop/Dockerfile#L6-L8)
+2. **Working directory.** `WORKDIR /app` đặt thư mục làm việc bên trong container. Các đường dẫn đích tương đối trong `COPY` và lệnh `python app.py` được tính từ `/app`. [Dòng 10–20](02-docker/develop/Dockerfile#L10-L20)
+3. **Thứ tự copy `requirements.txt`.** Docker copy `requirements.txt` và chạy `pip install` trước khi copy mã nguồn. Khi em chỉ sửa `app.py`, Docker có thể dùng lại layer cài dependencies từ cache, giúp lần build sau nhanh hơn. [Dòng 13–20](02-docker/develop/Dockerfile#L13-L20)
+4. **`CMD` và `ENTRYPOINT`.** `CMD` đặt lệnh hoặc đối số mặc định và có thể được thay bằng đối số truyền sau tên image trong `docker run`. `ENTRYPOINT` dạng exec đặt chương trình chính của container. Khi dùng cả hai, `CMD` thường cung cấp đối số mặc định cho `ENTRYPOINT`. Dockerfile này dùng `CMD ["python", "app.py"]` để chạy app theo mặc định. [Dòng 29–30](02-docker/develop/Dockerfile#L29-L30)
+
+### Exercise 2.2 — Build và chạy container develop
+
+Em chạy các lệnh sau từ gốc repo. Em truyền `question` qua query string theo cách [handler develop](02-docker/develop/app.py#L20-L22) nhận dữ liệu.
+
+```bash
+docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+docker run --rm -d --name day14-cp2-develop -p 127.0.0.1:8000:8000 my-agent:develop
+curl -i http://127.0.0.1:8000/health
+curl -i -X POST 'http://127.0.0.1:8000/ask?question=What%20is%20Docker%3F'
+```
+
+Docker build thành công image `my-agent:develop`. Lệnh `docker run` báo `Conflict` vì tên `day14-cp2-develop` đã được dùng. Hai lệnh `curl` vẫn nhận phản hồi từ app đang nghe trên cổng `8000`.
+
+Kết quả thực tế của `GET /health`:
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"status":"ok","uptime_seconds":49.6,"container":true}
+```
+
+Kết quả thực tế của `POST /ask`:
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+```
+
+### Exercise 2.3 — Multi-stage build và dung lượng image
+
+- **Builder.** Stage `builder` dùng `python:3.11-slim`, cài `gcc` và `libpq-dev`, rồi cài Python dependencies vào `/root/.local`. [Dòng 16–29](02-docker/production/Dockerfile#L16-L29)
+- **Runtime.** Stage `runtime` bắt đầu từ một image `python:3.11-slim` mới, lấy các Python packages đã cài từ `builder`, thêm code của app và chạy bằng user `appuser`. Base image `slim` và việc giữ công cụ biên dịch ở stage `builder` giúp giảm dung lượng image cuối. [Dòng 36–58](02-docker/production/Dockerfile#L36-L58)
+
+Em build image production và đo hai image bằng `docker images` từ gốc repo.
+
+```bash
+docker build -f 02-docker/production/Dockerfile -t my-agent:advanced .
+docker images my-agent --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
+```
+
+| Image | Dung lượng Docker hiển thị | Dung lượng quy về MB |
+| --- | ---: | ---: |
+| `my-agent:develop` | 1.67 GB | 1.670 MB |
+| `my-agent:advanced` | 265 MB | 265 MB |
+
+Theo số hiển thị, image production giảm khoảng **84,1%** so với develop, tính bằng `(1.670 − 265) / 1.670 × 100`.
+
+### Exercise 2.4 — Docker Compose và Nginx
+
+```mermaid
+flowchart LR
+    C[Client] -->|HTTP cổng 80| N[Nginx]
+    N -->|HTTP cổng 8000| A[Agent FastAPI]
+    A -.->|Phụ thuộc lúc khởi động| R[Redis cổng 6379]
+    A -.->|Phụ thuộc lúc khởi động| Q[Qdrant cổng 6333]
+```
+
+Nginx nhận request từ máy host trên cổng `80` rồi chuyển tiếp đến `agent:8000` qua mạng `internal` của Compose. Redis là dịch vụ cache và Qdrant là cơ sở dữ liệu vector. Compose chờ hai dịch vụ này healthy trước khi khởi động agent. Đường nét đứt trong sơ đồ thể hiện phụ thuộc lúc khởi động. Trong lần test này, handler `/ask` gọi mock LLM trực tiếp. [Compose](02-docker/production/docker-compose.yml#L22-L51) · [Nginx](02-docker/production/nginx/nginx.conf#L14-L29) · [Handler `/ask`](02-docker/production/main.py#L57-L64)
+
+Em kiểm tra stack và gọi hai endpoint từ máy host bằng các lệnh sau.
+
+```bash
+docker compose -p k5-day14-docker ps
+curl -i http://127.0.0.1/health
+curl -i -X POST http://127.0.0.1/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"Explain microservices"}'
+```
+
+Kết quả `docker compose ps` cho thấy cả bốn service đều chạy.
+
+| Service | Trạng thái | Cổng trong output |
+| --- | --- | --- |
+| `agent` | Up, healthy | `8000/tcp` |
+| `nginx` | Up | Host `80` → `80/tcp`, host `443` → `443/tcp` |
+| `qdrant` | Up, healthy | `6333–6334/tcp` |
+| `redis` | Up, healthy | `6379/tcp` |
+
+`GET /health` trả về kết quả sau qua Nginx.
+
+```http
+HTTP/1.1 200 OK
+Server: nginx
+Content-Type: application/json
+
+{"status":"ok","uptime_seconds":429.9,"version":"2.0.0","timestamp":"2026-11-26T09:05:12.670490"}
+```
+
+`POST /ask` nhận câu hỏi trong JSON và trả lời qua Nginx.
+
+```http
+HTTP/1.1 200 OK
+Server: nginx
+Content-Type: application/json
+
+{"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+```
+
 ## AI log
 
 - **CP1:** Em hỏi Codex về thứ tự làm lab và cách thực hiện Exercise 1.1–1.3. Codex gợi ý dòng code cần đọc, chỉ ra cú pháp query string của bản develop và soạn phần trình bày từ output em cung cấp. Em tự chạy hai app trong terminal, dùng `curl` để kiểm tra mã HTTP và nội dung phản hồi, rồi gửi output thực tế làm bằng chứng.
+- **CP2, Exercise 2.1–2.2.** Em hỏi Codex cách đọc Dockerfile, chạy container và hiểu lỗi trùng tên. Codex giải thích các chỉ thị trong Dockerfile và soạn mục trả lời từ log em cung cấp. Em tự chạy `docker build`, `docker run` và hai lệnh `curl` trong terminal, rồi gửi output để ghi lại kết quả thực tế.
+- **CP2, Exercise 2.3.** Em chạy build và `docker images` để lấy dung lượng hai image. Codex giải thích hai stage trong Dockerfile production và tính phần trăm giảm từ số đo em gửi.
+- **CP2, Exercise 2.4.** Em hỏi Codex cách chạy Compose và kiểm tra API qua Nginx. Em tự chạy stack, xem trạng thái bằng `docker compose ps` và dùng `curl` để kiểm tra hai endpoint. Codex đối chiếu cấu hình để vẽ sơ đồ và ghi kết quả từ output em gửi.
