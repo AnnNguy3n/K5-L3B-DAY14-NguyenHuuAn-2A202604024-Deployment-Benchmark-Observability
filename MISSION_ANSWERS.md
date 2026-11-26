@@ -375,6 +375,33 @@ Total messages: 10
 
 Cả ba replica đã xử lý request của cùng một session. History cuối có đủ 10 tin nhắn, gồm 5 câu hỏi và 5 câu trả lời. Kết quả cho thấy các replica đang chạy đọc được cùng một lịch sử từ Redis. [Script kiểm tra session](05-scaling-reliability/production/test_stateless.py#L41-L82)
 
+## Part 6 — Final Project (CP5)
+
+Agent xác thực `X-API-Key`, kiểm tra giới hạn lượt gọi và ngân sách trước khi gọi mock LLM. Rate limiter dùng cửa sổ trượt 60 giây trong Redis để các worker dùng chung số lượt. Chi phí được cộng dồn theo ngày UTC trong Redis, với ước lượng hai token mỗi từ. [Luồng `/ask`](06-lab-complete/app/main.py#L80-L92) · [Rate limiter](06-lab-complete/app/rate_limiter.py) · [Cost guard](06-lab-complete/app/cost_guard.py)
+
+Khi Redis mất kết nối, `/health` vẫn trả `200` vì process còn chạy, còn `/ready` trả `503` vì agent chưa sẵn sàng nhận request. Trong phép thử với giới hạn 5 lượt/phút, lượt tiếp theo trả `429` và vẫn bị chặn sau khi agent khởi động lại. Phép thử ngân sách thấp nhận `402`. Khi nhận `SIGTERM`, request đang xử lý vẫn trả `200`. Image Docker đo được **297 MB**, và `docker stop` hoàn tất trong **0,5 giây** với exit code `0`.
+
+Kết quả từ `python check_production_ready.py` chạy đầy đủ với Docker trong `06-lab-complete/`.
+
+```text
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 41/41 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+```
+
 ## AI log
 
 - **CP1:** Em hỏi Codex về thứ tự làm lab và cách thực hiện Exercise 1.1–1.3. Codex gợi ý dòng code cần đọc, chỉ ra cú pháp query string của bản develop và soạn phần trình bày từ output em cung cấp. Em tự chạy hai app trong terminal, dùng `curl` để kiểm tra mã HTTP và nội dung phản hồi, rồi gửi output thực tế làm bằng chứng.
@@ -388,3 +415,4 @@ Cả ba replica đã xử lý request của cùng một session. History cuối 
 - **CP4, Exercise 5.1.** Em hỏi Codex về phản hồi `401` khi gọi `/ready`. Codex đối chiếu mã nguồn và phát hiện một dịch vụ demo cũng dùng cổng `8000`, rồi hướng dẫn chuyển app CP4 sang cổng `8014`. Em tự chạy lại hai lệnh `curl`, kiểm tra cả hai trả `200` và gửi output thực tế để ghi vào bài.
 - **CP4, Exercise 5.2.** Codex hướng dẫn cách gửi request chạy nền rồi gửi `SIGTERM` và giúp em đọc thứ tự các dòng log. Em tự chạy phép thử, kiểm tra `curl` nhận câu trả lời với HTTP `200` và đối chiếu với log shutdown của Uvicorn.
 - **CP4, Exercise 5.3–5.5.** Codex hướng dẫn bật stack ba replica, kiểm tra `X-Served-By` và đọc kết quả `test_stateless.py`. Em tự chạy Compose, ba lệnh `curl` và script, rồi gửi output để ghi lại ba instance xử lý request và 10 tin nhắn trong history.
+- **CP5.** Em hỏi Codex về thứ tự hoàn thiện agent và cách kiểm tra từng tiêu chí. Codex đối chiếu bản khung với script chấm, hướng dẫn nối auth, rate limit và cost guard vào `/ask`, rồi kiểm tra các thay đổi có sẵn trong repo. Em dùng output từ lần Codex chạy script chấm đầy đủ với Docker để đối chiếu kết quả và ghi tiến độ.
