@@ -295,6 +295,86 @@ referrer-policy: strict-origin-when-cross-origin
 
 Rate limit kiểm soát tần suất gọi API. Cost guard kiểm soát số tiền đã dùng, vì các request có độ dài khác nhau có thể tốn số token khác nhau dù cùng nằm trong hạn mức lượt gọi.
 
+## Part 5 — Scaling & Reliability
+
+### Exercise 5.1 — Health check và readiness
+
+Em chạy app mẫu trong `05-scaling-reliability/develop/` trên cổng `8014` vì cổng `8000` cũng có một dịch vụ demo. Sau khi Uvicorn khởi động xong, em gọi `GET /health` và `GET /ready` tại `http://127.0.0.1:8014`. Kết quả em ghi được như sau.
+
+```text
+INFO:     127.0.0.1:63069 - "GET /health HTTP/1.1" 200 OK
+{"status":"ok","uptime_seconds":12.4,"version":"1.0.0","environment":"development","timestamp":"2026-11-26T10:41:35.114924+00:00","checks":{"memory":{"status":"ok","used_percent":48.1}}}
+/health → HTTP 200
+INFO:     127.0.0.1:63070 - "GET /ready HTTP/1.1" 200 OK
+{"ready":true,"in_flight_requests":1}
+/ready  → HTTP 200
+```
+
+- **`/health` (liveness).** HTTP `200` và `status: ok` cho thấy tiến trình đang phản hồi. Body còn ghi uptime `12.4` giây và mức sử dụng bộ nhớ `48.1%` tại thời điểm kiểm tra. [Handler `/health`](05-scaling-reliability/develop/app.py#L104-L144)
+- **`/ready` (readiness).** HTTP `200` và `ready: true` cho biết instance đã sẵn sàng nhận traffic. Theo code, endpoint trả `503` khi `_is_ready` là `False`. Giá trị `in_flight_requests: 1` tính cả request `/ready` đang được xử lý vì middleware tăng bộ đếm trước khi gọi handler. [Middleware đếm request](05-scaling-reliability/develop/app.py#L72-L81) · [Handler `/ready`](05-scaling-reliability/develop/app.py#L147-L168)
+
+### Exercise 5.2 — Graceful shutdown
+
+Em gửi `POST /ask?question=hello` bằng `curl` chạy nền trên cổng `8014`, rồi gửi `SIGTERM` cho tiến trình Uvicorn khi request đang xử lý. Em trích các dòng log và phản hồi chính dưới đây.
+
+```text
+INFO:     Shutting down
+INFO:     127.0.0.1:63138 - "POST /ask?question=hello HTTP/1.1" 200 OK
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+HTTP 200
+INFO:     Waiting for application shutdown.
+2026-11-26 17:44:59,114 INFO 🔄 Graceful shutdown initiated...
+2026-11-26 17:44:59,115 INFO ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [32500]
+2026-11-26 17:44:59,115 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+
+Log ghi `Shutting down` trước khi request nhận được câu trả lời và HTTP `200`. Sau đó, Uvicorn ghi `Application shutdown complete` và tiến trình kết thúc. Kết quả cho thấy request đang xử lý đã hoàn tất trong lần thử này. Uvicorn điều phối việc tắt server, còn phần shutdown trong FastAPI lifespan đặt `_is_ready` về `False` và ghi log khi hoàn tất. [FastAPI lifespan](05-scaling-reliability/develop/app.py#L41-L66) · [Cấu hình Uvicorn](05-scaling-reliability/develop/app.py#L175-L199)
+
+### Exercise 5.3 — Lưu session trong Redis
+
+Sau khi bật stack production, em gọi `GET /health` và `POST /chat` qua cổng `8080`. Cả hai trả HTTP `200`. Body của `/health` có `"storage":"redis"` và `"redis_connected":true`, còn `/chat` trả `"storage":"redis"` cùng `session_id` mới.
+
+Mỗi replica có vùng nhớ riêng. Nếu lưu history trong RAM, khi Nginx chuyển lượt tiếp theo sang replica khác, replica đó sẽ thiếu các tin nhắn trước. App mẫu lưu session trong Redis dùng chung với khóa `session:<session_id>` và TTL 1 giờ. Khi client gửi lại `session_id`, replica nhận request dùng khóa đó để đọc và cập nhật history. [Hàm đọc và ghi session](05-scaling-reliability/production/app.py#L59-L89) · [Handler `/chat`](05-scaling-reliability/production/app.py#L128-L157)
+
+### Exercise 5.4 — Chạy ba replica qua Nginx
+
+Trong `05-scaling-reliability/production/`, em tạo `.env.local` và chạy:
+
+```bash
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+docker compose -p k5-day14-scaling ps
+```
+
+Build hoàn tất. Kết quả `ps` có ba container `agent`, một Redis ở trạng thái `healthy` và một Nginx mở cổng `8080`. Em kiểm tra địa chỉ upstream trong header `X-Served-By` từ ba lệnh `curl`.
+
+| Request qua Nginx | HTTP | `X-Served-By` | ID trong body |
+| --- | --- | --- | --- |
+| `GET /health` | `200` | `172.18.0.4:8000` | `instance-2ce996` |
+| `GET /ready` | `200` | `172.18.0.3:8000` | `instance-71c1f8` |
+| `POST /chat` | `200` | `172.18.0.5:8000` | `instance-a5dc05` |
+
+Ba request đi qua cùng một địa chỉ Nginx nhưng được chuyển tới ba upstream khác nhau. [Cấu hình Compose](05-scaling-reliability/production/docker-compose.yml#L18-L74) · [Cấu hình Nginx](05-scaling-reliability/production/nginx.conf#L7-L30)
+
+### Exercise 5.5 — Kiểm tra history qua nhiều replica
+
+Em chạy `python test_stateless.py`. Script tạo một session mới, dùng lại `session_id` đó cho các lượt sau, rồi gọi API history. Em trích kết quả như sau.
+
+```text
+Session ID: b46efb62-643e-4dab-815e-bd4c583c9154
+Request 1: [instance-2ce996]
+Request 2: [instance-71c1f8]
+Request 3: [instance-a5dc05]
+Request 4: [instance-2ce996]
+Request 5: [instance-71c1f8]
+Total requests: 5
+Instances used: {'instance-a5dc05', 'instance-71c1f8', 'instance-2ce996'}
+Total messages: 10
+```
+
+Cả ba replica đã xử lý request của cùng một session. History cuối có đủ 10 tin nhắn, gồm 5 câu hỏi và 5 câu trả lời. Kết quả cho thấy các replica đang chạy đọc được cùng một lịch sử từ Redis. [Script kiểm tra session](05-scaling-reliability/production/test_stateless.py#L41-L82)
+
 ## AI log
 
 - **CP1:** Em hỏi Codex về thứ tự làm lab và cách thực hiện Exercise 1.1–1.3. Codex gợi ý dòng code cần đọc, chỉ ra cú pháp query string của bản develop và soạn phần trình bày từ output em cung cấp. Em tự chạy hai app trong terminal, dùng `curl` để kiểm tra mã HTTP và nội dung phản hồi, rồi gửi output thực tế làm bằng chứng.
@@ -305,3 +385,6 @@ Rate limit kiểm soát tần suất gọi API. Cost guard kiểm soát số ti�
 - **CP3, Exercise 4.2.** Em hỏi Codex cách lấy JWT và dùng token để gọi API. Codex hướng dẫn lệnh đăng nhập, giải thích cách server ký và xác minh token, rồi ghi lại phản hồi em gửi. Em tự lấy token, gọi `POST /ask` bằng `curl` và kiểm tra phản hồi `200 OK`.
 - **CP3, Exercise 4.3.** Em hỏi Codex cách kiểm tra rate limit. Codex hướng dẫn vòng lặp `curl`, giải thích cửa sổ trượt và tóm tắt output em gửi. Em tự chạy 20 lượt, kiểm tra mã HTTP từng lượt và xác định lượt 11 là lượt đầu trả `429`.
 - **CP3, Exercise 4.4.** Em nhờ Codex giải thích cost guard của bản mẫu và cách thiết kế ngân sách tháng bằng Redis. Codex đối chiếu `check_budget`, `record_usage` với yêu cầu trong đề và giúp em viết phần giải thích. Phản hồi `curl` do em chạy ở Exercise 4.3 được dùng làm ví dụ cho giá trị chi phí đã ghi nhận.
+- **CP4, Exercise 5.1.** Em hỏi Codex về phản hồi `401` khi gọi `/ready`. Codex đối chiếu mã nguồn và phát hiện một dịch vụ demo cũng dùng cổng `8000`, rồi hướng dẫn chuyển app CP4 sang cổng `8014`. Em tự chạy lại hai lệnh `curl`, kiểm tra cả hai trả `200` và gửi output thực tế để ghi vào bài.
+- **CP4, Exercise 5.2.** Codex hướng dẫn cách gửi request chạy nền rồi gửi `SIGTERM` và giúp em đọc thứ tự các dòng log. Em tự chạy phép thử, kiểm tra `curl` nhận câu trả lời với HTTP `200` và đối chiếu với log shutdown của Uvicorn.
+- **CP4, Exercise 5.3–5.5.** Codex hướng dẫn bật stack ba replica, kiểm tra `X-Served-By` và đọc kết quả `test_stateless.py`. Em tự chạy Compose, ba lệnh `curl` và script, rồi gửi output để ghi lại ba instance xử lý request và 10 tin nhắn trong history.
