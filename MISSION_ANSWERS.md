@@ -171,6 +171,34 @@ Content-Type: application/json
 {"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
 ```
 
+## Part 3 — Cloud Deployment (CP6)
+
+### Exercise 3.2 — Deploy lên Render
+
+Em deploy agent Part 6 từ thư mục `06-lab-complete/` bằng Render Blueprint. `day14-agent` chạy Docker và dùng `REDIS_URL` để kết nối nội bộ với `day14-redis`. Em đặt `AGENT_API_KEY` trên Render. URL public của agent là `https://day14-agent-xo0y.onrender.com`. [Hướng dẫn kiểm tra](DEPLOYMENT.md) · [Ảnh service Live](screenshots/running.png)
+
+| Phép thử | Mã HTTP ghi nhận |
+| --- | --- |
+| `GET /health` | `200` |
+| `GET /ready` | `200` |
+| `POST /ask` thiếu `X-API-Key` | `401` |
+| `POST /ask` có `X-API-Key` hợp lệ | `200` |
+
+Kết quả cho thấy agent đang chạy, kết nối được Redis và yêu cầu key hợp lệ cho `/ask`. [Ảnh kết quả](screenshots/test.png)
+
+### Exercise 3.1 — So sánh cấu hình Railway và Render
+
+Hai file đều dùng Dockerfile và chọn `/health` để kiểm tra agent. `railway.toml` đặt `builder = "DOCKERFILE"` và `healthcheckPath` cho một service. Khi triển khai theo cấu hình này, em sẽ tạo Redis riêng rồi đặt `REDIS_URL` và `AGENT_API_KEY` trong phần Variables. `render.yaml` khai báo cả web service lẫn Key Value trong cùng Blueprint. `rootDir` chọn thư mục cần build, `fromService` lấy chuỗi kết nối từ Key Value, còn `sync: false` để nhập API key trên dashboard. Nhờ vậy Blueprint có thể tạo hai dịch vụ và cấu hình kết nối giữa chúng trong cùng một lần deploy. [railway.toml](06-lab-complete/railway.toml) · [render.yaml](06-lab-complete/render.yaml)
+
+### Exercise 3.3 — Pipeline CI/CD trên Cloud Run
+
+1. Cloud Build cài dependencies và chạy `pytest` trong bước `test`.
+2. Bước `build` tạo Docker image với hai tag là commit SHA và `latest`, rồi bước `push` đẩy cả hai lên registry.
+3. Bước `deploy` dùng `gcloud run deploy` để triển khai image theo commit SHA lên Cloud Run ở `asia-southeast1`.
+4. `service.yaml` mô tả cấu hình runtime gồm port, autoscaling, probe `/health` và `/ready`, cùng biến môi trường lấy từ Secret Manager.
+
+[cloudbuild.yaml](03-cloud-deployment/production-cloud-run/cloudbuild.yaml) · [service.yaml](03-cloud-deployment/production-cloud-run/service.yaml)
+
 ## Part 4 — API Security
 
 ### Exercise 4.1 — Xác thực bằng API key
@@ -416,3 +444,4 @@ Kết quả từ `python check_production_ready.py` chạy đầy đủ với Do
 - **CP4, Exercise 5.2.** Codex hướng dẫn cách gửi request chạy nền rồi gửi `SIGTERM` và giúp em đọc thứ tự các dòng log. Em tự chạy phép thử, kiểm tra `curl` nhận câu trả lời với HTTP `200` và đối chiếu với log shutdown của Uvicorn.
 - **CP4, Exercise 5.3–5.5.** Codex hướng dẫn bật stack ba replica, kiểm tra `X-Served-By` và đọc kết quả `test_stateless.py`. Em tự chạy Compose, ba lệnh `curl` và script, rồi gửi output để ghi lại ba instance xử lý request và 10 tin nhắn trong history.
 - **CP5.** Em hỏi Codex về thứ tự hoàn thiện agent và cách kiểm tra từng tiêu chí. Codex đối chiếu bản khung với script chấm, hướng dẫn nối auth, rate limit và cost guard vào `/ask`, rồi kiểm tra các thay đổi có sẵn trong repo. Em dùng output từ lần Codex chạy script chấm đầy đủ với Docker để đối chiếu kết quả và ghi tiến độ.
+- **CP6.** Em hỏi Codex cách triển khai CP6 và cách kiểm tra bài đã đủ yêu cầu. Codex gợi ý cấu hình Render Blueprint, đối chiếu ảnh triển khai và gọi lại ba phép thử công khai. Em dùng ảnh kết quả đã lưu để đối chiếu cả bốn mã HTTP, trong đó có phép thử dùng API key, rồi nhờ Codex ghi lại cấu hình và kết quả vào báo cáo.
